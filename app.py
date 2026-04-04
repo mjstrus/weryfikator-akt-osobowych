@@ -723,6 +723,375 @@ def page_raport_zbiorczy():
 
 
 # ─────────────────────────────────────────────
+#  STRONA: UPLOAD AI
+# ─────────────────────────────────────────────
+
+def _get_api_key() -> str | None:
+    """Pobiera klucz API z st.secrets lub zmiennej środowiskowej."""
+    try:
+        return st.secrets["ANTHROPIC_API_KEY"]
+    except Exception:
+        import os
+        return os.environ.get("ANTHROPIC_API_KEY")
+
+
+def _build_doc_dropdown_options() -> dict[str, str]:
+    """Buduje słownik {label: doc_id} do dropdownu ręcznego przypisania."""
+    options = {"— wybierz dokument —": None}
+    section_names = {"A": "Część A – Rekrutacja", "B": "Część B – Zatrudnienie",
+                     "C": "Część C – Ustanie", "D": "Część D – Kary",
+                     "E": "Część E – Trzeźwość", "P": "Pozaaktowa"}
+    current_section = None
+    for section in SECTIONS:
+        sid = section["id"]
+        for q in section["questions"]:
+            q_id = q["id"]
+            if sid != current_section:
+                current_section = sid
+                options[f"── {section_names.get(sid, sid)} ──"] = None
+            options[f"  {q_id} – {q['text']}"] = q_id
+    return options
+
+
+def page_upload_ai():
+    from ai_analyzer import analyze_uploaded_files, results_to_answers, FILENAME_PATTERNS
+
+    st.markdown(
+        """<div class="app-header">
+        <h1>🤖 Analiza AI – Upload Dokumentów</h1>
+        <p>Wgraj skany PDF pracownika → AI identyfikuje dokumenty → gotowy raport audytowy.</p>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+    api_key = _get_api_key()
+    if not api_key:
+        st.error(
+            "❌ Brak klucza Anthropic API. "
+            "Dodaj `ANTHROPIC_API_KEY` w ustawieniach Streamlit Cloud → Secrets "
+            "lub w pliku `.streamlit/secrets.toml` lokalnie."
+        )
+        with st.expander("Jak dodać klucz API?"):
+            st.markdown("""
+**Lokalnie** – utwórz plik `.streamlit/secrets.toml`:
+```toml
+ANTHROPIC_API_KEY = "sk-ant-..."
+```
+
+**Streamlit Cloud** – wejdź w ustawienia aplikacji → **Secrets** → dodaj:
+```
+ANTHROPIC_API_KEY = "sk-ant-..."
+```
+""")
+        return
+
+    # ── Stan analizy ─────────────────────────────
+    stage = st.session_state.get("ai_stage", "input")  # input → analyzing → review → summary
+
+    # ── ETAP: DANE PODSTAWOWE + UPLOAD ───────────
+    if stage == "input":
+        st.subheader("1️⃣ Dane pracownika")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.text_input("🏢 Firma klienta *", key="ai_firma")
+            st.text_input("Imię *", key="ai_imie")
+            st.text_input("Stanowisko *", key="ai_stanowisko")
+            st.text_input("PESEL *", key="ai_pesel", max_chars=11)
+        with col2:
+            st.text_input("Nazwisko *", key="ai_nazwisko")
+            st.date_input("Data zatrudnienia *", key="ai_data_zatrudnienia")
+            st.selectbox(
+                "Status *",
+                STATUS_OPTIONS,
+                format_func=lambda x: "✅ Aktualnie zatrudniony" if x == "aktualny" else "📤 Były pracownik",
+                key="ai_status",
+            )
+
+        if st.session_state.get("ai_status") == "aktualny":
+            col1, col2 = st.columns(2)
+            with col1:
+                st.selectbox("Wymiar etatu", WYMIAR_ETATU_OPTIONS, key="ai_wymiar")
+            with col2:
+                st.radio("Osiąga min. wynagrodzenie?", ["TAK", "NIE"],
+                         key="ai_min_wynagrodzenie", horizontal=True)
+
+        st.divider()
+        st.subheader("2️⃣ Wgraj dokumenty PDF")
+
+        st.info(
+            "💡 **Wskazówka:** Nazwy plików przyspieszają identyfikację. "
+            "Przykłady: `B3_umowa_o_prace.pdf`, `A6_orzeczenie.pdf`, `bhp.pdf`\n\n"
+            "Możesz wgrać pojedyncze pliki lub wielostronicowe PDF-y (każda strona = osobny dokument)."
+        )
+
+        uploaded = st.file_uploader(
+            "Wybierz pliki PDF (możesz zaznaczyć wiele naraz)",
+            type=["pdf"],
+            accept_multiple_files=True,
+            key="ai_uploaded_files",
+        )
+
+        if uploaded:
+            st.success(f"✅ Wgrano {len(uploaded)} plik(ów)")
+            for f in uploaded:
+                st.caption(f"📄 {f.name}")
+
+        st.divider()
+        st.subheader("3️⃣ Dane weryfikatora")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.date_input("Data weryfikacji", key="ai_data_weryfikacji")
+        with col2:
+            st.text_input("Weryfikujący – imię i nazwisko", key="ai_weryfikujacy")
+        with col3:
+            st.text_input("Stanowisko weryfikującego", key="ai_weryfikujacy_stanowisko")
+
+        st.divider()
+
+        col_start, col_reset, _ = st.columns([2, 2, 6])
+        with col_start:
+            start = st.button(
+                "🤖 Analizuj dokumenty",
+                type="primary",
+                use_container_width=True,
+                disabled=not uploaded,
+            )
+        with col_reset:
+            if st.button("🔄 Resetuj", use_container_width=True):
+                for k in [k for k in st.session_state if k.startswith("ai_")]:
+                    del st.session_state[k]
+                st.rerun()
+
+        if start:
+            if not st.session_state.get("ai_firma", "").strip():
+                st.error("❌ Podaj nazwę firmy.")
+                return
+            if not uploaded:
+                st.error("❌ Wgraj przynajmniej jeden plik PDF.")
+                return
+            st.session_state["ai_stage"] = "analyzing"
+            st.rerun()
+
+    # ── ETAP: ANALIZA AI ─────────────────────────
+    elif stage == "analyzing":
+        st.subheader("🔄 Trwa analiza dokumentów...")
+
+        uploaded = st.session_state.get("ai_uploaded_files", [])
+        if not uploaded:
+            st.error("Brak plików do analizy. Wróć do poprzedniego kroku.")
+            st.session_state["ai_stage"] = "input"
+            st.rerun()
+            return
+
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+
+        results_holder = []
+
+        def progress_cb(current, total, filename):
+            pct = int(current / total * 100) if total > 0 else 100
+            progress_bar.progress(pct)
+            if current < total:
+                status_text.markdown(f"📄 Analizuję: **{filename}** ({current + 1}/{total})")
+            else:
+                status_text.markdown("✅ Analiza zakończona!")
+
+        try:
+            results = analyze_uploaded_files(uploaded, api_key, progress_cb)
+            st.session_state["ai_results"] = results
+
+            # Podziel na pewne i wątpliwe
+            pewne = [r for r in results if r["status"] == "PEWNY" and r["document_id"]]
+            watpliwe = [r for r in results if r["status"] == "WĄTPLIWY"]
+
+            st.session_state["ai_confirmed"] = pewne.copy()
+            st.session_state["ai_queue"] = watpliwe.copy()
+            st.session_state["ai_queue_idx"] = 0
+
+            if watpliwe:
+                st.session_state["ai_stage"] = "review"
+            else:
+                st.session_state["ai_stage"] = "summary"
+            st.rerun()
+
+        except Exception as e:
+            st.error(f"❌ Błąd podczas analizy: {e}")
+            if st.button("← Wróć"):
+                st.session_state["ai_stage"] = "input"
+                st.rerun()
+
+    # ── ETAP: KOLEJKA WĄTPLIWYCH ─────────────────
+    elif stage == "review":
+        queue = st.session_state.get("ai_queue", [])
+        idx = st.session_state.get("ai_queue_idx", 0)
+        confirmed = st.session_state.get("ai_confirmed", [])
+
+        if idx >= len(queue):
+            st.session_state["ai_stage"] = "summary"
+            st.rerun()
+            return
+
+        item = queue[idx]
+        total_q = len(queue)
+
+        st.subheader(f"🔍 Weryfikacja wątpliwych dokumentów ({idx + 1}/{total_q})")
+        st.progress((idx) / total_q)
+
+        st.markdown("---")
+        col1, col2 = st.columns([1, 2])
+
+        with col1:
+            st.markdown(f"**📄 Plik:** `{item['filename']}`")
+            st.markdown(f"**🤖 AI mówi:** {item['reason']}")
+            if item.get("document_id"):
+                q_text = QUESTION_MAP.get(item["document_id"], {}).get("text", "?")
+                st.info(f"Propozycja AI: **{item['document_id']}** – {q_text}")
+            else:
+                st.warning("AI nie rozpoznało dokumentu")
+
+            if item.get("image_png"):
+                st.image(item["image_png"], caption="Nagłówek dokumentu (top 20%)", use_container_width=True)
+
+        with col2:
+            st.markdown("**Co chcesz zrobić z tym plikiem?**")
+
+            # Opcja 1: Akceptuj propozycję AI
+            if item.get("document_id"):
+                q_text = QUESTION_MAP.get(item["document_id"], {}).get("text", "")
+                if st.button(
+                    f"✅ Akceptuj: {item['document_id']} – {q_text}",
+                    use_container_width=True,
+                    key="btn_accept",
+                ):
+                    confirmed.append({**item, "status": "PEWNY"})
+                    st.session_state["ai_confirmed"] = confirmed
+                    st.session_state["ai_queue_idx"] = idx + 1
+                    st.rerun()
+
+            # Opcja 2: Przypisz ręcznie
+            st.markdown("**📋 Lub przypisz ręcznie:**")
+            doc_options = _build_doc_dropdown_options()
+            labels = list(doc_options.keys())
+
+            selected_label = st.selectbox(
+                "Wybierz dokument z listy",
+                labels,
+                key=f"manual_select_{idx}",
+            )
+            selected_id = doc_options.get(selected_label)
+
+            if st.button("📌 Przypisz wybrany", use_container_width=True, key="btn_assign",
+                         disabled=not selected_id):
+                q_text = QUESTION_MAP.get(selected_id, {}).get("text", "")
+                confirmed.append({
+                    **item,
+                    "document_id": selected_id,
+                    "status": "PEWNY",
+                    "reason": f"Ręcznie przypisany jako {selected_id} – {q_text}",
+                })
+                st.session_state["ai_confirmed"] = confirmed
+                st.session_state["ai_queue_idx"] = idx + 1
+                st.rerun()
+
+            st.divider()
+
+            # Opcja 3: Pomiń
+            if st.button("⏭️ Pomiń (oznacz jako BRAK)", use_container_width=True, key="btn_skip"):
+                st.session_state["ai_queue_idx"] = idx + 1
+                st.rerun()
+
+    # ── ETAP: PODSUMOWANIE I ZAPIS ───────────────
+    elif stage == "summary":
+        confirmed = st.session_state.get("ai_confirmed", [])
+        all_results = st.session_state.get("ai_results", [])
+
+        st.subheader("📊 Podsumowanie analizy")
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Wszystkich plików/stron", len(all_results))
+        col2.metric("Zidentyfikowanych pewnie", len([r for r in all_results if r["status"] == "PEWNY"]))
+        col3.metric("Potwierdzonych przez użytkownika", len(confirmed))
+
+        st.divider()
+
+        if confirmed:
+            st.markdown("**✅ Zidentyfikowane dokumenty:**")
+            for r in confirmed:
+                q_text = QUESTION_MAP.get(r["document_id"], {}).get("text", "?")
+                src = "🤖 AI" if r.get("source") in ("AI", "FILENAME+AI") else "👤 Ręcznie"
+                st.markdown(f"- `{r['document_id']}` – {q_text} &nbsp; {src}")
+        else:
+            st.warning("Brak zidentyfikowanych dokumentów.")
+
+        unidentified = [r for r in all_results if r not in confirmed and r["status"] == "WĄTPLIWY"]
+        if unidentified:
+            with st.expander(f"⚠️ Nieprzypisane pliki ({len(unidentified)})"):
+                for r in unidentified:
+                    st.caption(f"❓ {r['filename']} – {r['reason']}")
+
+        st.divider()
+        st.subheader("💾 Zapisz audyt")
+
+        # Konwertuj potwierdzone wyniki na odpowiedzi formularza
+        answers = results_to_answers(confirmed)
+
+        status = st.session_state.get("ai_status", "aktualny")
+        wymiar = st.session_state.get("ai_wymiar", "Pełny etat")
+        scores = sc.calculate_scores(answers, status, wymiar)
+
+        # Pokaż ryzyko
+        risk = scores["risk_level"]
+        st.markdown(f"**Wyliczony poziom ryzyka:** {risk_badge(risk)}", unsafe_allow_html=True)
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Braki obowiązkowe", scores["obligatory_gaps"])
+        col2.metric("Braki warunkowe", scores["conditional_gaps"])
+        col3.metric("Kompletność", f"{scores['completeness']:.1f}%")
+
+        st.divider()
+
+        col_save, col_back, _ = st.columns([2, 2, 6])
+        with col_save:
+            if st.button("💾 Zapisz audyt", type="primary", use_container_width=True):
+                audyt_data = {
+                    "firma": st.session_state.get("ai_firma", "").strip(),
+                    "imie": st.session_state.get("ai_imie", "").strip(),
+                    "nazwisko": st.session_state.get("ai_nazwisko", "").strip(),
+                    "stanowisko": st.session_state.get("ai_stanowisko", "").strip(),
+                    "data_zatrudnienia": format_date(st.session_state.get("ai_data_zatrudnienia")),
+                    "pesel": st.session_state.get("ai_pesel", "").strip(),
+                    "status_pracownika": status,
+                    "wymiar_etatu": wymiar if status == "aktualny" else None,
+                    "minimalne_wynagrodzenie": st.session_state.get("ai_min_wynagrodzenie") if status == "aktualny" else None,
+                    "odpowiedzi": answers,
+                    "braki_obowiazkowe": scores["obligatory_gaps"],
+                    "braki_warunkowe": scores["conditional_gaps"],
+                    "braki_dobrowolne": scores["voluntary_gaps"],
+                    "kompletnosc_procent": scores["completeness"],
+                    "poziom_ryzyka": scores["risk_level"],
+                    "gap_list": scores["gap_list"],
+                    "data_weryfikacji": format_date(st.session_state.get("ai_data_weryfikacji")),
+                    "weryfikujacy_imie_nazwisko": st.session_state.get("ai_weryfikujacy", "").strip(),
+                    "weryfikujacy_stanowisko": st.session_state.get("ai_weryfikujacy_stanowisko", "").strip(),
+                }
+                new_id = db.save_audyt(audyt_data)
+                st.success(f"✅ Audyt zapisany! ID: {new_id}")
+                st.balloons()
+
+                # Wyczyść stan AI
+                for k in [k for k in st.session_state if k.startswith("ai_")]:
+                    del st.session_state[k]
+
+                st.session_state["view_audyt_id"] = new_id
+                st.session_state["page"] = "szczegoly"
+                st.rerun()
+
+        with col_back:
+            if st.button("← Wróć do inputu", use_container_width=True):
+                st.session_state["ai_stage"] = "input"
+                st.rerun()
+
+
+# ─────────────────────────────────────────────
 #  SIDEBAR NAWIGACJA
 # ─────────────────────────────────────────────
 
@@ -739,7 +1108,6 @@ def sidebar_nav():
             unsafe_allow_html=True,
         )
 
-        # Licznik audytów
         try:
             all_audyty = db.get_all_audyty()
             n = len(all_audyty)
@@ -754,7 +1122,8 @@ def sidebar_nav():
         st.divider()
 
         menu_items = {
-            "nowy": "➕ Nowy audyt",
+            "nowy": "✏️ Formularz ręczny",
+            "upload_ai": "🤖 Upload AI",
             "lista": "📋 Lista audytów",
             "szczegoly": "🔍 Szczegóły audytu",
             "raport": "📊 Raport zbiorczy",
@@ -793,6 +1162,8 @@ def main():
 
     if page == "nowy":
         page_nowy_audyt()
+    elif page == "upload_ai":
+        page_upload_ai()
     elif page == "lista":
         page_lista_audytow()
     elif page == "szczegoly":
