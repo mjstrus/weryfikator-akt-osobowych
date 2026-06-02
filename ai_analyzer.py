@@ -1,367 +1,211 @@
-# ai_analyzer.py – Analiza dokumentów kadrowych przez Claude API
-# Strategia: crop top 20% strony → base64 PNG → Claude identyfikuje dokument
+"""
+ai_analyzer.py — LOKALNY silnik analizy dokumentów (bez API, RODO-safe).
+=======================================================================
+Adapter pod interfejs, którego oczekuje app.py -> page_upload_ai():
+    analyze_uploaded_files(uploaded, api_key, progress_cb) -> list[result]
+    results_to_answers(confirmed) -> dict[q_id, wartość_odpowiedzi]
+    FILENAME_PATTERNS -> dict[q_id, list[fragment_nazwy]]
 
-import base64
-import json
-import re
-import fitz  # PyMuPDF
-import anthropic
-from config import QUESTION_MAP
+Detekcja delegowana do pdf_ingest (OCR + rozmyte sygnatury). Dane NIE opuszczają
+serwera — parametr `api_key` jest przyjmowany dla zgodności sygnatury, ale ignorowany.
 
-# ─────────────────────────────────────────────
-#  SŁOWNIK WZORCÓW NAZW PLIKÓW
-# ─────────────────────────────────────────────
+Format wyniku (zgodny z oczekiwaniami app.py):
+    {
+      "filename":    str,
+      "document_id": str | None,   # ID pytania z config.QUESTION_MAP
+      "status":      "PEWNY" | "WĄTPLIWY",
+      "reason":      str,          # uzasadnienie czytelne dla audytora
+      "source":      "LOKALNIE",
+      "image_png":   bytes | None, # podgląd nagłówka (tylko dla WĄTPLIWY)
+    }
 
-FILENAME_PATTERNS: dict[str, list[str]] = {
-    "A1": ["kwestionariusz_kandydat", "kw_kandydat", "kandydat"],
-    "A2": ["cv", "curriculum_vitae", "zyciorys", "życiorys"],
-    "A3": ["list_motywacyjny", "list_mot", "motywacyjny"],
-    "A4": ["kwalifikacje", "dyplom", "certyfikat", "swiadectwo_szkol", "wyksztalcenie"],
-    "A5": ["skierowanie_badania", "skierowanie_wstepne", "badania_wstepne"],
-    "A6": ["orzeczenie_lekarskie", "orzeczenie", "zdolny_do_pracy", "zaswiadczenie_lekarskie"],
-    "B1": ["kwestionariusz_zatrudniony", "kw_zatrudniony", "kwestionariusz_osobowy"],
-    "B2": ["rodo", "zgoda_dane", "przetwarzanie_danych", "zgoda_rodo"],
-    "B3": ["umowa_o_prace", "umowa_pracy", "umowa_prace"],
-    "B4": ["informacja_warunki", "warunki_zatrudnienia", "inf_warunki"],
-    "B5": ["zakres_obowiazkow", "zakres_czynnosci", "obowiazki"],
-    "B6": ["bhp", "szkolenie_bhp", "bezpieczenstwo", "instruktaz_bhp"],
-    "B7": ["pit2", "pit_2"],
-    "B8": ["rowne_traktowanie", "rownosc", "antydyskryminacja"],
-    "B9": ["kup", "koszty_uzyskania", "oświadczenie_kup"],
-    "B10": ["fp", "fundusz_pracy", "oswiadczenie_fp"],
-    "B11": ["regulamin", "zapoznanie_regulamin", "potwierdzenie_regulamin"],
-    "B12": ["wyplata_wynagrodzenia", "sposob_wyplaty", "konto_bankowe", "wyplata"],
-    "B13": ["opieka_188", "kp188", "art_188", "opieka_dziecko"],
-    "B14": ["powierzenie_mienia", "mienie", "powierzenie"],
-    "B15": ["obwieszczenie_czas", "system_pracy", "rozklad_czasu"],
-    "B16": ["rodzina_zus", "czlonek_rodziny", "ubezpieczenie_rodziny"],
-    "B17": ["zapoznanie_obwieszczenie", "podpisanie_obwieszczenie"],
-    "B18": ["ppk", "pracownicze_plany", "deklaracja_ppk"],
-    "B19": ["aneks", "aneksy", "zmiana_umowy"],
-    "B20": ["zajecie_wierzytelnosci", "komornik", "wierzytelnosc"],
-    "B21": ["wniosek_urlopowy", "urlop", "wnioski_urlop"],
-    "C1": ["rozwiazanie_umowy", "wypowiedzenie", "rozwiazanie", "swiadectwo_rozw"],
-    "C2": ["swiadectwo_pracy", "odbior_swiadectwa", "potwierdzenie_swiadectwa"],
-    "C3": ["sprostowanie_swiadectwa", "sprostowanie"],
-    "C4": ["ekwiwalent_urlop", "ekwiwalent", "rozliczenie_urlop"],
-    "D1": ["kara_porzadkowa", "upomnienie", "nagana", "zawiadomienie_ukaranie"],
-    "D2": ["wyjasnienia_pracownik", "wyjasnienia"],
-    "D3": ["usuniecie_kary", "kara_usunieta"],
-    "E1": ["trzezwosc", "kontrola_trzezwosci", "protokol_trzezwosc", "protokol_trzeźwosc"],
-    "E2": ["wyniki_badania", "badanie_trzezwosc"],
-    "E3": ["uzasadnienie_kontroli"],
-    "P1": ["ewidencja_czasu", "ewidencja_cp", "ecp"],
-    "P2": ["karta_urlopowa", "karty_urlopowe"],
-    "P3": ["lista_obecnosci", "obecnosc"],
-    "P4": ["lista_plac", "lista_wynagrodzen", "lp"],
-    "P5": ["wyplata_rak", "rece_wlasne", "rak_wlasnych"],
-    "P6": ["odziez_robocza", "ekwiwalent_odziez", "bhp_odziez"],
-    "P7": ["zasilki", "dokumentacja_zasilkowa", "l4", "zwolnienie_lekarskie"],
-    "P8": ["karta_przychodow", "przychody", "karta_zarobkow"],
-    "P9": ["zus_zua", "zua"],
-    "P10": ["zus_zwua", "zwua", "wyrejestrowanie"],
-    "P11": ["zus_zcna", "zcna"],
+OGRANICZENIE: dla pytań wieloopcjowych zależnych od listy płac (PAYROLL_DEPENDENT)
+sama obecność druku nie potwierdza "stosowania". Dla typów lp_5/wyplata_4 wstawiamy
+"Jest oświadczenie i nie jest stosowane", co scoring.get_gap_status klasyfikuje jako
+'wymaga_weryfikacji' — pozycja trafia więc do listy braków jako do sprawdzenia
+(nie znika jako 'ok'). needs_payroll_review() zwraca te ID dodatkowo, gdyby UI
+chciało je wyróżnić osobno.
+"""
+
+from __future__ import annotations
+
+import io
+
+from config import QUESTION_MAP, ANS
+import pdf_ingest
+
+# ---------------------------------------------------------------------------
+# Mapowanie wartości odpowiedzi per typ pytania (indeksy w config.ANS, żeby
+# napisy zgadzały się 1:1 z opcjami radio w formularzu).
+# present = dokument wykryty; absent = brak / niewykryty.
+# ---------------------------------------------------------------------------
+_PRESENT_IDX = {
+    "tak_nie": 0,       # "TAK"
+    "tak_nie_nd": 0,    # "TAK"
+    "lp_5": 1,          # "Jest oświadczenie i nie jest stosowane" -> scoring: wymaga_weryfikacji
+    "wyplata_3": 0,     # "TAK"
+    "wyplata_4": 1,     # "Jest oświadczenie i nie jest stosowane" -> scoring: wymaga_weryfikacji
+    "aneksy": 2,        # "Były aneksy i są w aktach"            (z detekcji – pewne -> ok)
+    "wnioski_url": 0,   # "Tak"                                  (z detekcji – pewne -> ok)
+    "ekwiwalent": 0,    # "Jest wniosek i wypłacono"            (PLACEHOLDER – "wypłacono" niepewne)
+}
+_ABSENT_IDX = {
+    "tak_nie": 1,       # "NIE"
+    "tak_nie_nd": 2,    # "ND"  – warunkowe: brak detekcji traktujemy jak "nie dotyczy",
+                        #        żeby nie zawyżać braków obowiązkowych
+    "lp_5": 3,          # "Nie ma oświadczenia i nie jest stosowane"
+    "wyplata_3": 1,     # "NIE"
+    "wyplata_4": 3,     # "Nie ma oświadczenia i nie jest stosowane"
+    "aneksy": 0,        # "Nie było aneksów"
+    "wnioski_url": 2,   # "Nie, ale urlop nie był wykorzystywany"
+    "ekwiwalent": 2,    # "Nie ma wniosku, bo nie należał się"
 }
 
-# Pełna lista dokumentów dla promptu AI
-DOCUMENT_LIST_FOR_PROMPT = """
-LISTA DOKUMENTÓW KADROWYCH (ID – nazwa):
-A1  – Kwestionariusz osobowy kandydata
-A2  – CV / życiorys zawodowy
-A3  – List motywacyjny
-A4  – Dokumenty potwierdzające kwalifikacje (dyplomy, certyfikaty, świadectwa szkolne)
-A5  – Skierowanie na badania wstępne
-A6  – Orzeczenie lekarskie dopuszczające do pracy
-B1  – Kwestionariusz osoby zatrudnionej
-B2  – Zgoda na przetwarzanie danych osobowych (RODO / klauzula)
-B3  – Umowa o pracę
-B4  – Informacja o warunkach zatrudnienia (art. 29 KP)
-B5  – Zakres obowiązków / czynności pracownika
-B6  – Szkolenie BHP – karta szkolenia / potwierdzenie odbycia
-B7  – PIT-2 / oświadczenie podatkowe
-B8  – Informacja dot. równego traktowania w zatrudnieniu
-B9  – Oświadczenie KUP (koszty uzyskania przychodu)
-B10 – Oświadczenie FP (Fundusz Pracy)
-B11 – Potwierdzenie zapoznania z regulaminem pracy
-B12 – Oświadczenie o sposobie wypłaty wynagrodzenia (przelew / gotówka)
-B13 – Oświadczenie opieka K.P. art. 188 (opieka nad dzieckiem)
-B14 – Dokumenty dot. powierzenia mienia pracownikowi
-B15 – Obwieszczenie o systemie i rozkładzie czasu pracy
-B16 – Wniosek o zgłoszenie członka rodziny do ubezpieczenia zdrowotnego
-B17 – Oświadczenie o zapoznaniu się z obwieszczeniem o czasie pracy
-B18 – Deklaracja PPK (Pracownicze Plany Kapitałowe)
-B19 – Aneks / aneksy do umowy o pracę
-B20 – Zajęcie wierzytelności / pismo komornicze
-B21 – Wnioski urlopowe
-C1  – Rozwiązanie umowy o pracę / wypowiedzenie
-C2  – Potwierdzenie odbioru świadectwa pracy
-C3  – Wniosek o sprostowanie świadectwa pracy
-C4  – Rozliczenie ekwiwalentu za urlop
-D1  – Odpis zawiadomienia o ukaraniu karą porządkową (upomnienie / nagana)
-D2  – Wyjaśnienia pracownika w sprawie kary porządkowej
-D3  – Informacja o usunięciu kary z akt pracowniczych
-E1  – Protokół z kontroli trzeźwości / substancji psychoaktywnych
-E2  – Wyniki badania trzeźwości
-E3  – Uzasadnienie przeprowadzenia kontroli trzeźwości
-P1  – Ewidencja czasu pracy
-P2  – Karty urlopowe
-P3  – Lista obecności
-P4  – Lista płac / lista wynagrodzeń
-P5  – Wnioski o wypłatę wynagrodzenia do rąk własnych
-P6  – Dokumentacja odzieży roboczej / ekwiwalentów BHP
-P7  – Dokumentacja zasiłkowa (ZUS, L4, zwolnienia lekarskie)
-P8  – Karty przychodów zatrudnionych
-P9  – ZUS ZUA (zgłoszenie pracownika do ubezpieczeń)
-P10 – ZUS ZWUA (wyrejestrowanie pracownika z ubezpieczeń)
-P11 – ZUS ZCNA (zgłoszenie członka rodziny do ubezpieczenia zdrowotnego)
-"""
+# Pytania, których obecność druku NIE rozstrzyga poprawnej wartości
+# (zależne od weryfikacji z listą płac). Wartość "present" to placeholder.
+PAYROLL_DEPENDENT = {"B7", "B9", "B10", "B12", "B18", "P5", "C4"}
 
-SYSTEM_PROMPT = f"""Jesteś ekspertem kadrowo-płacowym specjalizującym się w dokumentacji pracowniczej polskich firm.
-Otrzymujesz fragment górnej części dokumentu kadrowego (nagłówek, ok. 20% strony).
-Twoim zadaniem jest zidentyfikowanie, który dokument z listy to jest.
-
-{DOCUMENT_LIST_FOR_PROMPT}
-
-ZASADY:
-- Patrz głównie na nagłówek, tytuł, pierwsze zdania dokumentu
-- Ignoruj dane osobowe (nazwiska, numery PESEL, daty itp.)
-- Jeśli widzisz wyraźny tytuł pasujący do listy → status PEWNY
-- Jeśli masz wątpliwości (nieczytelny skan, brak tytułu, wiele możliwości) → status WĄTPLIWY
-- Jeśli dokument zupełnie nie pasuje do żadnej pozycji → document_id: null, status WĄTPLIWY
-
-Odpowiedz WYŁĄCZNIE poprawnym JSON-em (bez markdown, bez komentarzy):
-{{"document_id": "B3", "status": "PEWNY", "reason": "Nagłówek zawiera tytuł Umowa o pracę"}}
-"""
+# Wzorce nazw plików -> ID pytania, zbudowane z sygnatur pdf_ingest.
+FILENAME_PATTERNS: dict[str, list[str]] = {
+    sig.satisfies[0]: list(sig.filename_hints)
+    for sig in pdf_ingest.DOC_SIGNATURES
+    if sig.satisfies and sig.filename_hints
+}
 
 
-# ─────────────────────────────────────────────
-#  FUNKCJE POMOCNICZE
-# ─────────────────────────────────────────────
-
-def match_filename(filename: str) -> str | None:
-    """
-    Próbuje dopasować nazwę pliku do ID dokumentu na podstawie słownika wzorców.
-    Zwraca ID lub None jeśli brak pewnego dopasowania.
-    """
-    name = filename.lower()
-    # Usuń rozszerzenie i zamień separatory
-    name = re.sub(r'\.(pdf|png|jpg|jpeg)$', '', name)
-    name = name.replace('-', '_').replace(' ', '_')
-
-    # Szukaj wzorców
-    matches = []
-    for doc_id, patterns in FILENAME_PATTERNS.items():
-        for pattern in patterns:
-            if pattern in name:
-                matches.append(doc_id)
-                break
-
-    # Pewne dopasowanie tylko jeśli jeden wynik
-    if len(matches) == 1:
-        return matches[0]
-    return None
+def _answer_value(ans_type: str, present: bool) -> str:
+    """Zwraca napis odpowiedzi zgodny z opcjami radio dla danego typu pytania."""
+    table = _PRESENT_IDX if present else _ABSENT_IDX
+    opts = ANS.get(ans_type, ["TAK", "NIE"])
+    idx = table.get(ans_type, 0 if present else 1)
+    return opts[min(idx, len(opts) - 1)]
 
 
-def get_page_crop_png(pdf_bytes: bytes, page_idx: int = 0, crop_ratio: float = 0.22) -> bytes:
-    """
-    Wycina górne crop_ratio% strony PDF i zwraca PNG jako bytes.
-    Nie wysyła danych osobowych — tylko nagłówek/tytuł dokumentu.
-    """
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    if page_idx >= len(doc):
-        page_idx = 0
-    page = doc[page_idx]
-    rect = page.rect
-    clip = fitz.Rect(rect.x0, rect.y0, rect.x1, rect.y0 + rect.height * crop_ratio)
-    mat = fitz.Matrix(2.0, 2.0)  # 2x zoom dla lepszej czytelności
-    pixmap = page.get_pixmap(matrix=mat, clip=clip)
-    doc.close()
-    return pixmap.tobytes("png")
-
-
-def count_pdf_pages(pdf_bytes: bytes) -> int:
-    """Zwraca liczbę stron PDF."""
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    n = len(doc)
-    doc.close()
-    return n
-
-
-def analyze_page_with_ai(
-    image_png: bytes,
-    filename: str,
-    filename_hint: str | None,
-    client: anthropic.Anthropic,
-) -> dict:
-    """
-    Wysyła crop nagłówka do Claude API i zwraca wynik klasyfikacji.
-    
-    Zwraca dict: {
-        "document_id": str | None,
-        "status": "PEWNY" | "WĄTPLIWY",
-        "reason": str,
-        "source": "AI" | "FILENAME+AI"
+def _mk_result(filename, document_id, status, reason, image_png=None) -> dict:
+    return {
+        "filename": filename,
+        "document_id": document_id,
+        "status": status,
+        "reason": reason,
+        "source": "LOKALNIE",
+        "image_png": image_png,
     }
+
+
+def _classify_text(text: str, filename: str) -> list[dict]:
+    """Klasyfikuje pojedynczy plik (po treści + nazwie). Zwraca 1+ wyników.
+
+    - silne dopasowania (status 'obecny') -> każde jako osobny wynik PEWNY
+      (obsługuje przypadek wielu dokumentów w jednym skanie/teczce),
+    - tylko słabe ('do_weryfikacji') -> najlepszy jako WĄTPLIWY,
+    - brak -> WĄTPLIWY bez przypisania (trafia do kolejki przeglądu).
     """
-    b64 = base64.standard_b64encode(image_png).decode()
+    dets = pdf_ingest.detect_documents(text, [filename])
+    strong = [d for d in dets if d.status == "obecny"]
+    weak = sorted((d for d in dets if d.status == "do_weryfikacji"),
+                  key=lambda d: -d.score)
 
-    hint_text = ""
-    if filename_hint:
-        hint_text = f"\nWskazówka z nazwy pliku: plik może być dokumentem {filename_hint} ({QUESTION_MAP.get(filename_hint, {}).get('text', '')}). Potwierdź lub zaprzecz na podstawie treści."
+    if strong:
+        out = []
+        for d in strong:
+            qid = d.sig.satisfies[0] if d.sig.satisfies else None
+            out.append(_mk_result(
+                filename, qid, "PEWNY",
+                f"Rozpoznano: {d.sig.label} ({'; '.join(d.evidence)})",
+            ))
+        return out
 
-    user_message = f"Nazwa pliku: {filename}{hint_text}\n\nZidentyfikuj ten dokument kadrowy."
+    if weak:
+        d = weak[0]
+        qid = d.sig.satisfies[0] if d.sig.satisfies else None
+        return [_mk_result(
+            filename, qid, "WĄTPLIWY",
+            f"Słaby sygnał dla: {d.sig.label} ({'; '.join(d.evidence)}). "
+            f"Wymaga potwierdzenia.",
+        )]
 
+    return [_mk_result(
+        filename, None, "WĄTPLIWY",
+        "Nie rozpoznano typu dokumentu na podstawie treści ani nazwy pliku.",
+    )]
+
+
+def _render_header_png(pdf_bytes: bytes) -> bytes | None:
+    """Podgląd górnych ~25% pierwszej strony — do oceny wątpliwych przez człowieka.
+    Best-effort: bez pdf2image zwraca None (UI to obsługuje warunkowo)."""
     try:
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=300,
-            system=SYSTEM_PROMPT,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/png",
-                                "data": b64,
-                            },
-                        },
-                        {"type": "text", "text": user_message},
-                    ],
-                }
-            ],
-        )
-
-        raw = response.content[0].text.strip()
-        # Usuń ewentualne markdown fences
-        raw = re.sub(r"```json|```", "", raw).strip()
-        result = json.loads(raw)
-
-        source = "FILENAME+AI" if filename_hint and result.get("document_id") == filename_hint else "AI"
-        return {
-            "document_id": result.get("document_id"),
-            "status": result.get("status", "WĄTPLIWY"),
-            "reason": result.get("reason", "Brak uzasadnienia"),
-            "source": source,
-        }
-
-    except Exception as e:
-        return {
-            "document_id": filename_hint,
-            "status": "WĄTPLIWY",
-            "reason": f"Błąd analizy AI: {str(e)[:100]}",
-            "source": "ERROR",
-        }
+        from pdf2image import convert_from_bytes
+        imgs = convert_from_bytes(pdf_bytes, dpi=120, first_page=1, last_page=1)
+        if not imgs:
+            return None
+        img = imgs[0]
+        header = img.crop((0, 0, img.width, int(img.height * 0.25)))
+        buf = io.BytesIO()
+        header.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:  # noqa: BLE001 - podgląd jest opcjonalny
+        return None
 
 
-# ─────────────────────────────────────────────
-#  GŁÓWNA FUNKCJA ANALIZY
-# ─────────────────────────────────────────────
+def analyze_uploaded_files(uploaded, api_key=None, progress_cb=None) -> list[dict]:
+    """Analizuje wgrane pliki PDF LOKALNIE.
 
-def analyze_uploaded_files(
-    uploaded_files: list,
-    api_key: str,
-    progress_callback=None,
-) -> list[dict]:
+    api_key — ignorowany (silnik lokalny, dane nie opuszczają serwera).
+    progress_cb(current, total, filename) — opcjonalny callback postępu.
     """
-    Analizuje listę wgranych plików PDF.
-    
-    Każdy wynik: {
-        "filename": str,
-        "page": int,          # numer strony (0-based), dla 1-stronicowych = 0
-        "document_id": str | None,
-        "status": "PEWNY" | "WĄTPLIWY",
-        "reason": str,
-        "source": str,
-        "image_png": bytes,   # crop nagłówka do podglądu
-    }
-    """
-    client = anthropic.Anthropic(api_key=api_key)
-    results = []
+    results: list[dict] = []
+    total = len(uploaded)
 
-    # Rozwiń wielostronicowe PDF-y na strony
-    tasks = []  # lista (filename_display, pdf_bytes, page_idx)
-    for uf in uploaded_files:
-        pdf_bytes = uf.read()
-        n_pages = count_pdf_pages(pdf_bytes)
-        if n_pages == 1:
-            tasks.append((uf.name, pdf_bytes, 0))
-        else:
-            for i in range(n_pages):
-                tasks.append((f"{uf.name} (str. {i+1})", pdf_bytes, i))
+    for i, f in enumerate(uploaded):
+        name = getattr(f, "name", f"plik_{i + 1}.pdf")
+        if progress_cb:
+            progress_cb(i, total, name)
 
-    total = len(tasks)
-
-    for idx, (filename_display, pdf_bytes, page_idx) in enumerate(tasks):
-        if progress_callback:
-            progress_callback(idx, total, filename_display)
-
-        # Etap 1: dopasowanie nazwy pliku
-        base_name = filename_display.split(" (str.")[0]  # usuń suffix strony
-        filename_hint = match_filename(base_name)
-
-        # Etap 2: crop nagłówka
         try:
-            image_png = get_page_crop_png(pdf_bytes, page_idx)
-        except Exception as e:
-            results.append({
-                "filename": filename_display,
-                "page": page_idx,
-                "document_id": filename_hint,
-                "status": "WĄTPLIWY",
-                "reason": f"Błąd odczytu PDF: {str(e)[:80]}",
-                "source": "ERROR",
-                "image_png": None,
-            })
-            continue
+            f.seek(0)  # bufor mógł być już raz odczytany
+        except Exception:  # noqa: BLE001
+            pass
+        data = f.read()
 
-        # Etap 3: analiza AI
-        ai_result = analyze_page_with_ai(image_png, filename_display, filename_hint, client)
+        text = pdf_ingest.extract_text_from_pdf(data)
+        file_results = _classify_text(text, name)
 
-        results.append({
-            "filename": filename_display,
-            "page": page_idx,
-            "document_id": ai_result["document_id"],
-            "status": ai_result["status"],
-            "reason": ai_result["reason"],
-            "source": ai_result["source"],
-            "image_png": image_png,
-        })
+        # Podgląd nagłówka generujemy tylko dla wątpliwych (oszczędność OCR/CPU).
+        for r in file_results:
+            if r["status"] == "WĄTPLIWY":
+                r["image_png"] = _render_header_png(data)
 
-    if progress_callback:
-        progress_callback(total, total, "Analiza zakończona")
+        results.extend(file_results)
 
+    if progress_cb:
+        progress_cb(total, total, "")
     return results
 
 
-def results_to_answers(confirmed_results: list[dict]) -> dict:
+def results_to_answers(confirmed: list[dict]) -> dict[str, str]:
+    """Buduje słownik odpowiedzi formularza z potwierdzonych wyników.
+
+    KLUCZOWE: startujemy od wartości 'brak' dla KAŻDEGO pytania (inaczej
+    niewykryte dokumenty zostałyby policzone jako obecne), a następnie
+    nadpisujemy wykryte na 'obecny'. Dzięki temu scoring.calculate_scores
+    poprawnie wyłapie braki.
     """
-    Konwertuje potwierdzone wyniki analizy na słownik odpowiedzi formularza.
-    Dokumenty PEWNE i potwierdzone przez użytkownika → TAK
-    Pozostałe → NIE (domyślna odpowiedź z config)
-    """
-    from config import ANS, QUESTION_MAP
+    answers: dict[str, str] = {}
+    for qid, q in QUESTION_MAP.items():
+        answers[qid] = _answer_value(q.get("ans", "tak_nie"), present=False)
 
-    # Domyślnie wszystkie pytania → pierwsza opcja (zazwyczaj TAK lub pierwsza)
-    answers = {}
-    for q_id, q in QUESTION_MAP.items():
-        ans_type = q.get("ans", "tak_nie")
-        opts = ANS.get(ans_type, ["TAK", "NIE"])
-        # Dla tak_nie: domyślnie NIE (brak dokumentu)
-        answers[q_id] = "NIE" if "NIE" in opts else opts[-1]
-
-    # Zaznacz potwierdzone dokumenty jako TAK / pierwsza pozytywna opcja
-    for r in confirmed_results:
-        doc_id = r.get("document_id")
-        if not doc_id or doc_id not in QUESTION_MAP:
-            continue
-        q = QUESTION_MAP[doc_id]
-        ans_type = q.get("ans", "tak_nie")
-        opts = ANS.get(ans_type, ["TAK", "NIE"])
-        # Dla tak_nie/tak_nie_nd → TAK
-        # Dla złożonych → pierwsza opcja (zazwyczaj pozytywna)
-        answers[doc_id] = opts[0]
-
+    for r in confirmed:
+        qid = r.get("document_id")
+        if qid and qid in QUESTION_MAP:
+            answers[qid] = _answer_value(QUESTION_MAP[qid].get("ans", "tak_nie"),
+                                         present=True)
     return answers
+
+
+def needs_payroll_review(confirmed: list[dict]) -> list[str]:
+    """ID potwierdzonych pytań, których wartość to placeholder wymagający
+    weryfikacji z listą płac. UI może to pokazać jako ostrzeżenie."""
+    return sorted({
+        r["document_id"] for r in confirmed
+        if r.get("document_id") in PAYROLL_DEPENDENT
+    })
