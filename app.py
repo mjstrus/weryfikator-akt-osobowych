@@ -727,7 +727,8 @@ def page_raport_zbiorczy():
 # ─────────────────────────────────────────────
 
 def _get_api_key() -> str | None:
-    """Pobiera klucz API z st.secrets lub zmiennej środowiskowej."""
+    """Pobiera klucz API z st.secrets lub zmiennej środowiskowej.
+    (Niewykorzystywany w trybie lokalnym – pozostawiony dla zgodności.)"""
     try:
         return st.secrets["ANTHROPIC_API_KEY"]
     except Exception:
@@ -754,36 +755,21 @@ def _build_doc_dropdown_options() -> dict[str, str]:
 
 
 def page_upload_ai():
-    from ai_analyzer import analyze_uploaded_files, results_to_answers, FILENAME_PATTERNS
+    from ai_analyzer import (
+        analyze_uploaded_files, results_to_answers,
+        FILENAME_PATTERNS, needs_payroll_review,
+    )
 
     st.markdown(
         """<div class="app-header">
-        <h1>🤖 Analiza AI – Upload Dokumentów</h1>
-        <p>Wgraj skany PDF pracownika → AI identyfikuje dokumenty → gotowy raport audytowy.</p>
+        <h1>🔍 Analiza lokalna – Upload Dokumentów</h1>
+        <p>Wgraj skany PDF pracownika → analiza lokalna (bez API) identyfikuje dokumenty → gotowy raport audytowy.</p>
         </div>""",
         unsafe_allow_html=True,
     )
 
-    api_key = _get_api_key()
-    if not api_key:
-        st.error(
-            "❌ Brak klucza Anthropic API. "
-            "Dodaj `ANTHROPIC_API_KEY` w ustawieniach Streamlit Cloud → Secrets "
-            "lub w pliku `.streamlit/secrets.toml` lokalnie."
-        )
-        with st.expander("Jak dodać klucz API?"):
-            st.markdown("""
-**Lokalnie** – utwórz plik `.streamlit/secrets.toml`:
-```toml
-ANTHROPIC_API_KEY = "sk-ant-..."
-```
-
-**Streamlit Cloud** – wejdź w ustawienia aplikacji → **Secrets** → dodaj:
-```
-ANTHROPIC_API_KEY = "sk-ant-..."
-```
-""")
-        return
+    # Tryb lokalny – klucz API niepotrzebny (dane nie opuszczają serwera).
+    api_key = None
 
     # ── Stan analizy ─────────────────────────────
     stage = st.session_state.get("ai_stage", "input")  # input → analyzing → review → summary
@@ -851,7 +837,7 @@ ANTHROPIC_API_KEY = "sk-ant-..."
         col_start, col_reset, _ = st.columns([2, 2, 6])
         with col_start:
             start = st.button(
-                "🤖 Analizuj dokumenty",
+                "🔍 Analizuj dokumenty",
                 type="primary",
                 use_container_width=True,
                 disabled=not uploaded,
@@ -872,7 +858,7 @@ ANTHROPIC_API_KEY = "sk-ant-..."
             st.session_state["ai_stage"] = "analyzing"
             st.rerun()
 
-    # ── ETAP: ANALIZA AI ─────────────────────────
+    # ── ETAP: ANALIZA ────────────────────────────
     elif stage == "analyzing":
         st.subheader("🔄 Trwa analiza dokumentów...")
 
@@ -942,20 +928,20 @@ ANTHROPIC_API_KEY = "sk-ant-..."
 
         with col1:
             st.markdown(f"**📄 Plik:** `{item['filename']}`")
-            st.markdown(f"**🤖 AI mówi:** {item['reason']}")
+            st.markdown(f"**🔍 Wynik analizy:** {item['reason']}")
             if item.get("document_id"):
                 q_text = QUESTION_MAP.get(item["document_id"], {}).get("text", "?")
-                st.info(f"Propozycja AI: **{item['document_id']}** – {q_text}")
+                st.info(f"Propozycja: **{item['document_id']}** – {q_text}")
             else:
-                st.warning("AI nie rozpoznało dokumentu")
+                st.warning("Nie rozpoznano dokumentu")
 
             if item.get("image_png"):
-                st.image(item["image_png"], caption="Nagłówek dokumentu (top 20%)", use_container_width=True)
+                st.image(item["image_png"], caption="Nagłówek dokumentu (top 25%)", use_container_width=True)
 
         with col2:
             st.markdown("**Co chcesz zrobić z tym plikiem?**")
 
-            # Opcja 1: Akceptuj propozycję AI
+            # Opcja 1: Akceptuj propozycję
             if item.get("document_id"):
                 q_text = QUESTION_MAP.get(item["document_id"], {}).get("text", "")
                 if st.button(
@@ -987,6 +973,7 @@ ANTHROPIC_API_KEY = "sk-ant-..."
                     **item,
                     "document_id": selected_id,
                     "status": "PEWNY",
+                    "source": "RĘCZNIE",
                     "reason": f"Ręcznie przypisany jako {selected_id} – {q_text}",
                 })
                 st.session_state["ai_confirmed"] = confirmed
@@ -1018,10 +1005,18 @@ ANTHROPIC_API_KEY = "sk-ant-..."
             st.markdown("**✅ Zidentyfikowane dokumenty:**")
             for r in confirmed:
                 q_text = QUESTION_MAP.get(r["document_id"], {}).get("text", "?")
-                src = "🤖 AI" if r.get("source") in ("AI", "FILENAME+AI") else "👤 Ręcznie"
+                src = "🔍 Auto" if r.get("source") == "LOKALNIE" else "👤 Ręcznie"
                 st.markdown(f"- `{r['document_id']}` – {q_text} &nbsp; {src}")
         else:
             st.warning("Brak zidentyfikowanych dokumentów.")
+
+        # Pozycje wymagające weryfikacji z listą płac (placeholdery z auto-detekcji)
+        pr = needs_payroll_review(confirmed)
+        if pr:
+            st.warning(
+                "⚠️ Wartości wstawione automatycznie, wymagają weryfikacji z listą płac: "
+                + ", ".join(pr)
+            )
 
         unidentified = [r for r in all_results if r not in confirmed and r["status"] == "WĄTPLIWY"]
         if unidentified:
@@ -1123,7 +1118,7 @@ def sidebar_nav():
 
         menu_items = {
             "nowy": "✏️ Formularz ręczny",
-            "upload_ai": "🤖 Upload AI",
+            "upload_ai": "🔍 Analiza lokalna",
             "lista": "📋 Lista audytów",
             "szczegoly": "🔍 Szczegóły audytu",
             "raport": "📊 Raport zbiorczy",
